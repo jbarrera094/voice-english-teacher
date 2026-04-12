@@ -2,9 +2,13 @@
 
 A fully local, audio-to-audio English conversation partner running on your Mac. Speak naturally, get a spoken response — no cloud, no subscriptions, no internet required after setup.
 
+**Stack:** [Whisper](https://github.com/SYSTRAN/faster-whisper) (STT) → [LM Studio](https://lmstudio.ai) (chat LLM + **Orpheus 3B 0.1 fine-tuned Q4 GGUF**) → [**Orpheus-FastAPI**](https://github.com/Lex-au/Orpheus-FastAPI) (SNAC decode) → your speakers.
+
 ```
-You (mic) → Whisper STT → LM Studio LLM → Orpheus-FastAPI TTS → Speaker
+You (mic) → Whisper STT → LM Studio (chat) → LM Studio (Orpheus tokens) → Orpheus-FastAPI → WAV → Speaker
 ```
+
+Orpheus does not emit normal audio from LM Studio alone: the server returns SNAC token streams from `/v1/completions`. **Orpheus-FastAPI** calls that endpoint, decodes tokens to PCM, and exposes `/v1/audio/speech` for this script.
 
 ---
 
@@ -30,27 +34,33 @@ Tuned for **B1–B2 Spanish speakers** practicing conversational English, but ea
 ### Software
 
 - Python 3.9+
-- [LM Studio](https://lmstudio.ai) — serves both the chat model and Orpheus TTS
-- [Orpheus-FastAPI](https://github.com/Lex-au/Orpheus-FastAPI) — SNAC decoder bridge for Orpheus audio
+- [LM Studio](https://lmstudio.ai) — local OpenAI-compatible API on port **1234**; loads the chat model and the **orpheus-3b-0.1-ft** Q4 GGUF used for Orpheus token generation
+- [Orpheus-FastAPI](https://github.com/Lex-au/Orpheus-FastAPI) — separate Python app on port **5005**; bridges LM Studio’s Orpheus completions to playable audio
 
 ### Models (loaded in LM Studio)
 
-| Role       | Model                                       | Size on disk |
-| ---------- | ------------------------------------------- | ------------ |
-| Chat (LLM) | `google/gemma-3-4b` or any ≤4B chat model   | ~3 GB        |
-| TTS        | `isaiahbjork/orpheus-3b-0.1-ft-Q4_K_M-GGUF` | ~2.5 GB      |
+| Role       | Model | Notes |
+| ---------- | ----- | ----- |
+| Chat (LLM) | e.g. `google/gemma-3-4b` | Any small instruct/chat GGUF you prefer (≤4B keeps RAM headroom) |
+| Orpheus (TTS tokens) | **orpheus-3b-0.1-ft** Q4 GGUF | Example community build: `isaiahbjork/orpheus-3b-0.1-ft-Q4_K_M-GGUF` (~2.5 GB on disk) |
 
-Both models run simultaneously via LM Studio's multi-model session. Combined VRAM usage is ~5.5 GB, well within 16 GB.
+Download the **Q4** (e.g. Q4_K_M) variant in LM Studio’s **Search / Discover** tab so inference stays fast on Apple Silicon. Load **both** models in a **Multi Model Session**, then start the server from the **Developer** tab.
+
+Both models run at once in one LM Studio session. Combined footprint is typically on the order of ~5–6 GB VRAM for Gemma 4B Q4 + Orpheus 3B Q4 — comfortable on 16 GB unified memory.
 
 ---
 
 ## Installation
 
-### 1. Install LM Studio
+### 1. Install LM Studio and the Orpheus Q4 model
 
-Download from [lmstudio.ai](https://lmstudio.ai) and download both models from the Discover tab.
+1. Install [LM Studio](https://lmstudio.ai).
+2. In **Discover**, search for **orpheus-3b-0.1-ft** and download a **Q4** GGUF (e.g. **Q4_K_M**).
+3. Download your chat model (e.g. Gemma 3 4B) the same way.
 
 ### 2. Install Orpheus-FastAPI
+
+Orpheus-FastAPI is **required**: `english_teacher.py` talks to it at `http://localhost:5005/v1/audio/speech`; it is Orpheus-FastAPI that calls LM Studio for Orpheus completions and decodes SNAC output.
 
 ```bash
 git clone https://github.com/Lex-au/Orpheus-FastAPI
@@ -59,7 +69,7 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Edit `.env` and set:
+Edit Orpheus-FastAPI’s `.env` and point it at LM Studio’s completions API:
 
 ```env
 ORPHEUS_API_URL=http://localhost:1234/v1/completions
@@ -67,7 +77,11 @@ ORPHEUS_MODEL_NAME=orpheus-3b-0.1-ft
 ORPHEUS_MAX_TOKENS=8192
 ```
 
-The value of `ORPHEUS_MODEL_NAME` must match exactly what LM Studio reports — run `curl http://localhost:1234/v1/models` to check.
+`ORPHEUS_MODEL_NAME` must match the **exact** model id LM Studio exposes (often a short name like `orpheus-3b-0.1-ft` or a full GGUF path). Verify with:
+
+```bash
+curl http://localhost:1234/v1/models
+```
 
 ### 3. Install Python dependencies
 
@@ -76,6 +90,8 @@ pip install -r requirements.txt
 ```
 
 ### 4. Configure the script
+
+The **Orpheus** model name for LM Studio is set in **Orpheus-FastAPI’s** `.env` (`ORPHEUS_MODEL_NAME`), not in `english_teacher.py`.
 
 Open `english_teacher.py` and update:
 
@@ -98,11 +114,11 @@ Start the services in this order, each in its own terminal:
 
 **Terminal 1 — LM Studio**
 
-```
-Open LM Studio → Playground → "+" → Multi Model Session
-Load: gemma-3-4b  +  orpheus-3b-0.1-ft
-Developer tab → Start Server
-```
+1. **Playground** → **+** → **Multi Model Session**
+2. Load your **chat** model and **orpheus-3b-0.1-ft** (Q4 GGUF)
+3. **Developer** → **Start Server** (default `http://localhost:1234`)
+
+Keep this running while Orpheus-FastAPI and `english_teacher.py` are up.
 
 **Terminal 2 — Orpheus-FastAPI**
 
@@ -155,7 +171,7 @@ On startup the script checks that all services are running and prints the loaded
 | --------------------- | ------------ |
 | STT (Whisper base.en) | ~0.3 s       |
 | LLM (gemma-3-4b)      | ~1–2 s       |
-| TTS (Orpheus Q4_K_M)  | ~3–5 s       |
+| TTS (orpheus-3b-0.1-ft Q4) | ~3–5 s       |
 | **Total per turn**    | **~4–8 s**   |
 
 Most of the latency is in Orpheus synthesis. If you want faster responses at the cost of voice quality, switch to Kokoro via `mlx-audio` — it runs natively on Apple Silicon and reduces TTS latency to under a second.
@@ -199,7 +215,7 @@ Supported tags: `<laugh>`, `<chuckle>`, `<sigh>`, `<cough>`, `<gasp>`, `<yawn>`
 
 ## Troubleshooting
 
-**`[TTS] Reproduciendo (24000 Hz, 0.0s)`** — Orpheus-FastAPI is not finding the model. Check that `ORPHEUS_MODEL_NAME` in `.env` matches the model ID in LM Studio exactly.
+**`[TTS] Reproduciendo (24000 Hz, 0.0s)`** — Orpheus-FastAPI is not finding the Orpheus model in LM Studio. In **Orpheus-FastAPI’s** `.env`, set `ORPHEUS_MODEL_NAME` to the exact id from `curl http://localhost:1234/v1/models` (and ensure the orpheus-3b-0.1-ft Q4 GGUF is loaded in LM Studio).
 
 **`[warn] CHAT_MODEL configurado no encontrado`** — Copy the exact model name printed at startup and update `CHAT_MODEL` in the script.
 
@@ -215,11 +231,12 @@ Supported tags: `<laugh>`, `<chuckle>`, `<sigh>`, `<cough>`, `<gasp>`, `<yawn>`
 
 ```
 .
-├── english_teacher.py   # main pipeline script
-└── README.md
+├── english_teacher.py   # main pipeline (Whisper → LM Studio chat → Orpheus-FastAPI TTS)
+├── requirements.txt     # Python deps for this repo
+└── Readme.md
 ```
 
-Orpheus-FastAPI lives in its own cloned repo at whatever path you chose.
+Orpheus-FastAPI is a **separate** clone of [Lex-au/Orpheus-FastAPI](https://github.com/Lex-au/Orpheus-FastAPI); keep it on disk wherever you like and run `python app.py` from that directory.
 
 ---
 
