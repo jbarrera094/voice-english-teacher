@@ -1,70 +1,60 @@
 #!/usr/bin/env python3
 """
-English Teacher — pipeline audio→audio  (solo LM Studio)
-=========================================================
+English Teacher — variante con Kokoro TTS (Docker)
+====================================================
 Stack:
-  STT  : faster-whisper  (local, sin servidor)
-  LLM  : LM Studio  →  http://localhost:1234/v1/chat/completions
-  TTS  : LM Studio  →  Orpheus-FastAPI  →  http://localhost:5005
+  STT  : faster-whisper          (local)
+  LLM  : Groq API                (cloud, ~0.3s)
+  TTS  : Kokoro-FastAPI (Docker) (local, ~1-2s en M4 CPU)
+
+Ventajas vs variante Orpheus:
+  · TTS de 11s baja a ~1-2s — mucho más conversacional
+  · Sin LM Studio, sin Orpheus-FastAPI, sin dependencias MLX
+  · Setup de un solo comando Docker
+  · Imagen arm64 nativa para Apple Silicon
 
 Prereqs — instalar una sola vez:
-  pip install faster-whisper sounddevice soundfile numpy openai requests
+  pip install faster-whisper sounddevice soundfile numpy openai python-dotenv
 
 Servicios que deben estar corriendo ANTES de ejecutar este script:
-  ┌─────────────────────────────────────────────────────────────┐
-  │ 1. LM Studio — Multi-model session                          │
-  │    · Abre Playground → clic "+" → Multi Model Session       │
-  │    · Carga: gemma-3-4b-it  (o cualquier chat model ≤4B)     │
-  │    · Carga: orpheus-3b-0.1-ft-q4_k_m  (ya lo tienes)       │
-  │    · Developer tab → Start Server                           │
-  │                                                             │
-  │ 2. Orpheus-FastAPI (decodificador SNAC)                     │
-  │    git clone https://github.com/Lex-au/Orpheus-FastAPI      │
-  │    cd Orpheus-FastAPI && pip install -r requirements.txt     │
-  │    python app.py                                            │
-  └─────────────────────────────────────────────────────────────┘
+  1. Kokoro-FastAPI via Docker (versión estable):
+       docker run -p 8880:8880 ghcr.io/remsky/kokoro-fastapi-cpu:v0.2.2
+     (descarga el modelo automáticamente la primera vez, ~345 MB)
 
-Para ver los nombres exactos de los modelos cargados:
-  curl http://localhost:1234/v1/models
-
-Uso:
-  python english_teacher.py
-  → ENTER para empezar a grabar tu voz
-  → ENTER de nuevo para parar y procesar
-  → Ctrl+C para salir
+  2. Nada más — sin LM Studio, sin Orpheus-FastAPI
 """
 
 import sys
 import io
+import os
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
-import requests
 from openai import OpenAI
 from faster_whisper import WhisperModel
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ─────────────────────────────────────────────────────
-#  Configuración — ajusta estos valores según tu setup
+#  Configuración
 # ─────────────────────────────────────────────────────
+GROQ_API_KEY  = os.getenv("GROQ_API_KEY", "gsk_TU_API_KEY_AQUI")
+GROQ_MODEL    = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
-# Nombre del modelo de chat tal como aparece en LM Studio.
-# → Developer tab → copia el identificador exacto del modelo cargado.
-# Ejemplos comunes:
-#   "lmstudio-community/gemma-3-4b-it-GGUF/gemma-3-4b-it-Q4_K_M.gguf"
-#   "bartowski/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q4_K_M.gguf"
-CHAT_MODEL    = "google/gemma-3-4b"
+# Modelo Kokoro — con Docker no se especifica, el servidor lo maneja internamente
+KOKORO_MODEL  = os.getenv("KOKORO_MODEL", "kokoro")
 
-# Voz de Orpheus: tara · leah · jess · leo · dan · mia · zac · zoe
-ORPHEUS_VOICE = "tara"
-ORPHEUS_SPEED = 1.0
+# Voces inglés americano : af_heart · af_bella · af_nova · af_sky · am_adam · am_echo
+# Voces inglés británico : bf_alice · bf_emma · bm_daniel · bm_george
+KOKORO_VOICE  = os.getenv("KOKORO_VOICE", "af_heart")
+KOKORO_SPEED  = float(os.getenv("KOKORO_SPEED", "1.0"))
 
-# Whisper: tiny.en (más rápido) · base.en (equilibrado) · small.en (más preciso)
-WHISPER_MODEL = "base.en"
+# Whisper: tiny.en · base.en · small.en
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base.en")
 
-LM_STUDIO_URL   = "http://localhost:1234/v1"
-ORPHEUS_TTS_URL = "http://localhost:5005/v1/audio/speech"
-SAMPLE_RATE     = 16_000   # Hz — requerido por Whisper
-MAX_HISTORY     = 10       # turnos de conversación a recordar
+SAMPLE_RATE    = 16_000
+MAX_HISTORY    = int(os.getenv("MAX_HISTORY", "12"))
 
 SYSTEM_PROMPT = """You are a friendly English conversation partner helping a Spanish speaker \
 at B1-B2 level practice their English.
@@ -86,12 +76,14 @@ recording            = False
 recorded_frames      = []
 sd_stream            = None
 
-# Cliente OpenAI apuntando a LM Studio
-lm = OpenAI(base_url=LM_STUDIO_URL, api_key="lm-studio")
+groq = OpenAI(
+    base_url="https://api.groq.com/openai/v1",
+    api_key=GROQ_API_KEY,
+)
 
 
 # ─────────────────────────────────────────────────────
-#  Whisper — carga única al inicio
+#  Whisper
 # ─────────────────────────────────────────────────────
 def load_whisper():
     print(f"[setup] Cargando Whisper '{WHISPER_MODEL}'...")
@@ -152,7 +144,7 @@ def transcribe(whisper_model, audio: np.ndarray) -> str:
 
 
 # ─────────────────────────────────────────────────────
-#  LLM — LM Studio /v1/chat/completions
+#  LLM — Groq API
 # ─────────────────────────────────────────────────────
 def get_response(user_text: str) -> str:
     global conversation_history
@@ -161,16 +153,16 @@ def get_response(user_text: str) -> str:
     if len(conversation_history) > MAX_HISTORY * 2:
         conversation_history = conversation_history[-(MAX_HISTORY * 2):]
 
-    print("  [LLM] Pensando...")
+    print("  [LLM] Groq pensando...")
     try:
-        resp = lm.chat.completions.create(
-            model=CHAT_MODEL,
+        resp = groq.chat.completions.create(
+            model=GROQ_MODEL,
             messages=[{"role": "system", "content": SYSTEM_PROMPT}] + conversation_history,
             temperature=0.75,
-            max_tokens=200,
+            max_tokens=120,
         )
     except Exception as e:
-        return f"[LLM error: {e}]"
+        return f"[Groq error: {e}]"
 
     reply = resp.choices[0].message.content.strip()
     conversation_history.append({"role": "assistant", "content": reply})
@@ -178,35 +170,36 @@ def get_response(user_text: str) -> str:
 
 
 # ─────────────────────────────────────────────────────
-#  TTS — Orpheus-FastAPI (llama internamente a LM Studio)
+#  TTS — Kokoro via Kokoro-FastAPI Docker (OpenAI SDK)
 # ─────────────────────────────────────────────────────
-def speak(text: str):
-    print("  [TTS] Sintetizando con Orpheus...")
-    try:
-        resp = requests.post(
-            ORPHEUS_TTS_URL,
-            json={
-                "model": "orpheus",
-                "input": text,
-                "voice": ORPHEUS_VOICE,
-                "response_format": "wav",
-                "speed": ORPHEUS_SPEED,
-            },
-            timeout=90,
-        )
-        resp.raise_for_status()
-    except requests.exceptions.ConnectionError:
-        print("  [error] Orpheus-FastAPI no responde en puerto 5005.")
-        print("          Ejecuta: cd Orpheus-FastAPI && python app.py")
-        return
-    except Exception as e:
-        print(f"  [error] TTS: {e}")
-        return
 
-    audio_data, sr = sf.read(io.BytesIO(resp.content))
-    print(f"  [TTS] Reproduciendo ({sr} Hz, {len(audio_data)/sr:.1f}s)...")
-    sd.play(audio_data, sr)
-    sd.wait()
+# Cliente dedicado para Kokoro (separado del cliente Groq)
+kokoro = OpenAI(
+    base_url="http://localhost:8880/v1",
+    api_key="not-needed",
+)
+
+def speak(text: str):
+    print("  [TTS] Kokoro sintetizando...")
+    try:
+        response = kokoro.audio.speech.create(
+            model=KOKORO_MODEL,
+            voice=KOKORO_VOICE,
+            input=text,
+            response_format="wav",
+            speed=KOKORO_SPEED,
+        )
+        audio_data, sr = sf.read(io.BytesIO(response.content))
+        print(f"  [TTS] Reproduciendo ({sr} Hz, {len(audio_data)/sr:.1f}s)...")
+        sd.play(audio_data, sr)
+        sd.wait()
+    except Exception as e:
+        err = str(e)
+        if "Connection" in err or "refused" in err.lower():
+            print("  [error] Kokoro-FastAPI no responde en puerto 8880.")
+            print("          Ejecuta: docker run -p 8880:8880 ghcr.io/remsky/kokoro-fastapi-cpu:v0.2.2")
+        else:
+            print(f"  [error] TTS: {e}")
 
 
 # ─────────────────────────────────────────────────────
@@ -215,32 +208,27 @@ def speak(text: str):
 def check_services() -> bool:
     ok = True
 
-    # LM Studio
-    try:
-        models = lm.models.list()
-        names  = [m.id for m in models.data]
-        print(f"[ok] LM Studio activo — {len(names)} modelo(s) cargado(s):")
-        for n in names:
-            print(f"     · {n}")
-
-        # Avisar si el modelo de chat configurado no coincide
-        chat_found = any(CHAT_MODEL in n or n in CHAT_MODEL for n in names)
-        if not chat_found:
-            print(f"\n[warn] CHAT_MODEL configurado no encontrado:")
-            print(f"       '{CHAT_MODEL}'")
-            print(f"       Actualiza CHAT_MODEL en el script con uno de los nombres de arriba.\n")
-    except Exception:
-        print("[error] LM Studio no responde en puerto 1234.")
-        print("        Abre LM Studio → Developer tab → Start Server")
+    # Groq
+    if GROQ_API_KEY.startswith("gsk_TU_API_KEY"):
+        print("[error] Groq API key no configurada.")
+        print("        Edita tu .env y añade: GROQ_API_KEY=gsk_...")
         ok = False
+    else:
+        try:
+            groq.models.list()
+            print(f"[ok] Groq API activa — modelo: {GROQ_MODEL}")
+        except Exception as e:
+            print(f"[error] Groq API: {e}")
+            ok = False
 
-    # Orpheus-FastAPI
+    # Kokoro-FastAPI Docker
     try:
-        requests.get("http://localhost:5005", timeout=3)
-        print("[ok] Orpheus-FastAPI activo.")
+        kokoro.models.list()
+        print(f"[ok] Kokoro-FastAPI Docker activo — voz: {KOKORO_VOICE}")
     except Exception:
-        print("[error] Orpheus-FastAPI no responde en puerto 5005.")
-        print("        Ejecuta: cd Orpheus-FastAPI && python app.py")
+        print("[error] Kokoro-FastAPI no responde en puerto 8880.")
+        print("        Ejecuta en otra terminal:")
+        print("        docker run -p 8880:8880 ghcr.io/remsky/kokoro-fastapi-cpu:v0.2.2")
         ok = False
 
     print()
@@ -252,11 +240,11 @@ def check_services() -> bool:
 # ─────────────────────────────────────────────────────
 def main():
     print("=" * 55)
-    print("  English Teacher · backend: solo LM Studio")
+    print("  English Teacher · LLM: Groq  |  TTS: Kokoro Docker")
     print("=" * 55 + "\n")
 
     if not check_services():
-        print("[abort] Arranca los servicios indicados y vuelve a intentarlo.")
+        print("[abort] Resuelve los errores anteriores y vuelve a intentarlo.")
         sys.exit(1)
 
     whisper_model = load_whisper()
@@ -266,11 +254,10 @@ def main():
     print("  ENTER  → parar y procesar")
     print("  Ctrl+C → salir\n")
 
-    # Saludo inicial hablado
     greeting = (
-        "Hey! Great to meet you. I'm your English conversation partner. "
-        "Just speak naturally — I'll keep you talking. "
-        "What did you do today?"
+        "Hey! I'm your English conversation partner. "
+        "I'll help you practice naturally and correct any mistakes along the way. "
+        "What have you been up to today?"
     )
     print(f"[Teacher] {greeting}\n")
     speak(greeting)
