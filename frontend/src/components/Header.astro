@@ -1,0 +1,18 @@
+---
+import StatusBar from "./StatusBar.tsx";
+---
+
+<header class="flex-shrink-0 border-b border-border-subtle bg-surface-raised">
+  <div class="max-w-3xl mx-auto px-4 py-3 flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <div class="w-9 h-9 rounded-xl bg-accent/20 flex items-center justify-center">
+        <span class="text-lg">🎙</span>
+      </div>
+      <div>
+        <h1 class="text-base font-semibold leading-tight">English Teacher</h1>
+        <p class="text-xs text-text-secondary leading-tight">Practice your English</p>
+      </div>
+    </div>
+    <StatusBar client:load />
+  </div>
+</header>

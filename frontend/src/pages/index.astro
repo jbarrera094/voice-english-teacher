@@ -1,0 +1,12 @@
+---
+import Layout from "../layouts/Layout.astro";
+import Header from "../components/Header.astro";
+import ChatWindow from "../components/ChatWindow.tsx";
+---
+
+<Layout title="English Teacher">
+  <Header />
+  <main class="flex-1 overflow-hidden">
+    <ChatWindow client:load />
+  </main>
+</Layout>
