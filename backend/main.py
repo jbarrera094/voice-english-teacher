@@ -82,6 +82,11 @@ class SessionResponse(BaseModel):
     greeting: str
 
 
+class SessionHistoryResponse(BaseModel):
+    session_id: str
+    history: list[dict]
+
+
 class HealthResponse(BaseModel):
     lm_studio: bool
     orpheus: bool
@@ -99,6 +104,14 @@ async def health():
 async def create_session():
     sid = teacher.create_session()
     return SessionResponse(session_id=sid, greeting=GREETING)
+
+
+@app.get("/api/session/{session_id}", response_model=SessionHistoryResponse)
+async def get_session(session_id: str):
+    history = teacher.get_session_history(session_id)
+    if history is None:
+        raise HTTPException(404, "Session not found")
+    return SessionHistoryResponse(session_id=session_id, history=history)
 
 
 @app.post("/api/transcribe", response_model=TranscribeResponse)

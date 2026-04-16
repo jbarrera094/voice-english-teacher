@@ -5,10 +5,13 @@ Wraps Whisper STT, LM Studio chat, and Orpheus TTS into an async-friendly
 class that FastAPI endpoints can call without managing global state.
 """
 
+import json
 import logging
 import os
+import sqlite3
 import tempfile
 import uuid
+from pathlib import Path
 from typing import Optional
 
 import requests
@@ -52,8 +55,16 @@ class EnglishTeacher:
         self.lm = OpenAI(base_url=self.lm_studio_url, api_key="lm-studio")
         self.whisper: Optional[WhisperModel] = None
 
-        # Per-session conversation histories keyed by session id
+        # In-memory write-through cache; source of truth is SQLite
         self._sessions: dict[str, list[dict]] = {}
+
+        db_path = os.getenv("SESSION_DB", str(Path(__file__).resolve().parent / "sessions.db"))
+        self._db = sqlite3.connect(db_path, check_same_thread=False)
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS sessions "
+            "(session_id TEXT PRIMARY KEY, history TEXT NOT NULL DEFAULT '[]')"
+        )
+        self._db.commit()
 
     # ------------------------------------------------------------------
     #  Lifecycle
@@ -67,10 +78,25 @@ class EnglishTeacher:
     def create_session(self) -> str:
         sid = uuid.uuid4().hex[:12]
         self._sessions[sid] = []
+        self._db.execute(
+            "INSERT OR IGNORE INTO sessions (session_id, history) VALUES (?, '[]')", (sid,)
+        )
+        self._db.commit()
         return sid
+
+    def get_session_history(self, session_id: str) -> Optional[list[dict]]:
+        """Return the stored history for a session, or None if it does not exist."""
+        row = self._db.execute(
+            "SELECT history FROM sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row[0])
 
     def delete_session(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)
+        self._db.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        self._db.commit()
 
     # ------------------------------------------------------------------
     #  STT
@@ -104,12 +130,17 @@ class EnglishTeacher:
     # ------------------------------------------------------------------
 
     def get_response(self, user_text: str, session_id: str) -> str:
-        history = self._sessions.setdefault(session_id, [])
+        # Load from DB into cache if not already present
+        if session_id not in self._sessions:
+            stored = self.get_session_history(session_id)
+            self._sessions[session_id] = stored if stored is not None else []
+
+        history = self._sessions[session_id]
         history.append({"role": "user", "content": user_text})
 
         if len(history) > self.max_history * 2:
-            self._sessions[session_id] = history[-self.max_history * 2 :]
-            history = self._sessions[session_id]
+            history = history[-self.max_history * 2 :]
+            self._sessions[session_id] = history
 
         try:
             resp = self.lm.chat.completions.create(
@@ -124,6 +155,14 @@ class EnglishTeacher:
 
         reply = resp.choices[0].message.content.strip()
         history.append({"role": "assistant", "content": reply})
+
+        self._db.execute(
+            "INSERT INTO sessions (session_id, history) VALUES (?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET history = excluded.history",
+            (session_id, json.dumps(history)),
+        )
+        self._db.commit()
+
         return reply
 
     # ------------------------------------------------------------------

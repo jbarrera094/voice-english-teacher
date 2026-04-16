@@ -1,6 +1,7 @@
 import { useCallback, useRef, useState } from "react";
 
 const API = import.meta.env.PUBLIC_API_URL ?? "http://localhost:8000";
+const SESSION_STORAGE_KEY = "et_session_id";
 
 export type LoadingStage =
   | null
@@ -37,6 +38,17 @@ function makeId(): string {
   return `msg-${Date.now()}-${nextId++}`;
 }
 
+function historyToMessages(
+  history: { role: string; content: string }[]
+): Message[] {
+  return history.map((m) => ({
+    id: makeId(),
+    role: m.role === "assistant" ? "teacher" : "user",
+    text: m.content,
+    timestamp: Date.now(),
+  }));
+}
+
 export function useConversation(): UseConversationReturn {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -48,9 +60,36 @@ export function useConversation(): UseConversationReturn {
 
   const startSession = useCallback(async () => {
     try {
+      const savedId = localStorage.getItem(SESSION_STORAGE_KEY);
+
+      if (savedId) {
+        const res = await fetch(`${API}/api/session/${savedId}`);
+        if (res.ok) {
+          const data = await res.json();
+          setSessionId(savedId);
+          if (data.history.length > 0) {
+            setMessages(historyToMessages(data.history));
+          } else {
+            // Session exists but is empty — show the greeting without TTS
+            setMessages([
+              {
+                id: makeId(),
+                role: "teacher",
+                text: "Welcome back! What would you like to talk about?",
+                timestamp: Date.now(),
+              },
+            ]);
+          }
+          return;
+        }
+        // Session no longer exists on server — fall through to create a new one
+        localStorage.removeItem(SESSION_STORAGE_KEY);
+      }
+
       const res = await fetch(`${API}/api/session`, { method: "POST" });
       const data = await res.json();
       setSessionId(data.session_id);
+      localStorage.setItem(SESSION_STORAGE_KEY, data.session_id);
 
       const greetingMsg: Message = {
         id: makeId(),
